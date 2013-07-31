@@ -41,6 +41,7 @@ import string
 import sys
 import time
 import uuid
+from Foundation import *
 
 try: 
     # Just try for LLDB in case PYTHONPATH is already correctly setup
@@ -81,12 +82,15 @@ PARSE_MODE_IMAGES = 2
 PARSE_MODE_THREGS = 3
 PARSE_MODE_SYSTEM = 4
 
+DSYMS = []
+BUNDLES = []
+
 class CrashLog(symbolication.Symbolicator):
     """Class that does parses darwin crash logs"""
     thread_state_regex = re.compile('^Thread ([0-9]+) crashed with')
     thread_regex = re.compile('^Thread ([0-9]+)([^:]*):(.*)')
     frame_regex = re.compile('^([0-9]+) +([^ ]+) *\t?(0x[0-9a-fA-F]+) +(.*)')
-    image_regex_uuid = re.compile('(0x[0-9a-fA-F]+)[- ]+(0x[0-9a-fA-F]+) +[+]?([^ ]+) +([^<]+)<([-0-9a-fA-F]+)> (.*)');
+    image_regex_uuid = re.compile('(0x[0-9a-fA-F]+)[- ]+(0x[0-9a-fA-F]+) +[+]?([^ ]+) +([^<]+)<([-0-9a-fA-F]+)>(.*)');
     image_regex_no_uuid = re.compile('(0x[0-9a-fA-F]+)[- ]+(0x[0-9a-fA-F]+) +[+]?([^ ]+) +([^/]+)/(.*)');
     empty_line_regex = re.compile('^$')
         
@@ -154,6 +158,8 @@ class CrashLog(symbolication.Symbolicator):
             self.add_section (symbolication.Section(text_addr_lo, text_addr_hi, "__TEXT"))
             self.identifier = identifier
             self.version = version
+            self.dsyms = DSYMS
+            self.bundles = BUNDLES
         
         def locate_module_and_debug_symbols(self):
             # Don't load a module twice...
@@ -162,7 +168,37 @@ class CrashLog(symbolication.Symbolicator):
             # Mark this as resolved so we don't keep trying
             self.resolved = True
             uuid_str = self.get_normalized_uuid_string()
-            print 'Getting symbols for %s %s...' % (uuid_str, self.path),
+
+            def dwarfdump(path):
+                """Enumerates all (uuid, arch) in path"""
+                dwarfdump_cmd_output = commands.getoutput('dwarfdump --uuid "%s"' % path)
+                for line in dwarfdump_cmd_output.splitlines():
+                    match = self.dwarfdump_uuid_regex.search (line)
+                    if match:
+                        dwarf_uuid_str = match.group(1)
+                        dwarf_uuid = uuid.UUID(dwarf_uuid_str)
+                        arch = match.group(2)
+                        yield dwarf_uuid, arch
+
+            def dsyms(bundles):
+                """Enumerates all dsyms in path"""
+                for bundle_path in bundles:
+                    bundle = NSBundle.bundleWithPath_(bundle_path)
+                    if not bundle:
+                        continue
+                    for dwarf_uuid, arch in dwarfdump(bundle_path):
+                        yield bundle_path, dwarf_uuid, arch
+
+            def executables(bundles):
+                """Enumerates all executables in bundles"""
+                for bundle_path in bundles:
+                    bundle = NSBundle.bundleWithPath_(bundle_path)
+                    if not bundle:
+                        continue
+                    for dwarf_uuid, arch in dwarfdump(bundle.executablePath()):
+                        yield bundle.executablePath(), dwarf_uuid, arch
+
+            # print 'Getting symbols for %s %s...' % (uuid_str, self.path),
             if os.path.exists(self.dsymForUUIDBinary):
                 dsym_for_uuid_command = '%s %s' % (self.dsymForUUIDBinary, uuid_str)
                 s = commands.getoutput(dsym_for_uuid_command)
@@ -178,23 +214,37 @@ class CrashLog(symbolication.Symbolicator):
                             if 'DBGSymbolRichExecutable' in plist:
                                 self.resolved_path = os.path.expanduser (plist['DBGSymbolRichExecutable'])
             if not self.resolved_path and os.path.exists(self.path):
-                dwarfdump_cmd_output = commands.getoutput('dwarfdump --uuid "%s"' % self.path)
                 self_uuid = self.get_uuid()
-                for line in dwarfdump_cmd_output.splitlines():
-                    match = self.dwarfdump_uuid_regex.search (line)
-                    if match:
-                        dwarf_uuid_str = match.group(1)
-                        dwarf_uuid = uuid.UUID(dwarf_uuid_str)
-                        if self_uuid == dwarf_uuid:
-                            self.resolved_path = self.path
-                            self.arch = match.group(2)
-                            break;
+                for dwarf_uuid, arch in dwarfdump(self.path):
+                    if self_uuid == dwarf_uuid:
+                        self.resolved_path = self.path
+                        self.arch = arch
+                        break
                 if not self.resolved_path:
                     self.unavailable = True
                     print "error\n    error: unable to locate '%s' with UUID %s" % (self.path, uuid_str)
                     return False
+
+            if not self.resolved_path and self.identifier and self.get_uuid():
+                # Other option is to use PyObjC and NSMetadataQuery, but requires a lot more refactoring.
+                bundles = commands.getoutput("mdfind \"kMDItemCFBundleIdentifier == '{0}'\"".format(self.identifier)).splitlines()
+                bundles.extend(self.bundles)
+                self_uuid = self.get_uuid()
+
+                for exe_path, exe_uuid, exe_arch in executables(bundles):
+                    if self_uuid == exe_uuid:
+                        self.resolved_path = str(exe_path)  # unicode is not supported
+                        self.arch = exe_arch
+                        break
+
+            if not self.symfile:
+                for dsym_path, dsym_uuid, dsym_arch in dsyms(self.dsyms):
+                    if self_uuid == dsym_uuid:
+                        self.symfile = str(dsym_path)
+                        break
+
             if (self.resolved_path and os.path.exists(self.resolved_path)) or (self.path and os.path.exists(self.path)):
-                print 'ok'
+                print self.identifier + ' - ok'
                 # if self.resolved_path:
                 #     print '  exe = "%s"' % self.resolved_path 
                 # if self.symfile:
@@ -330,7 +380,7 @@ class CrashLog(symbolication.Symbolicator):
                                                   image_match.group(3).strip(), 
                                                   image_match.group(4).strip(), 
                                                   uuid.UUID(image_match.group(5)), 
-                                                  image_match.group(6))
+                                                  image_match.group(6).strip())
                     self.images.append (image)
                 else:
                     image_match = self.image_regex_no_uuid.search (line)
@@ -340,7 +390,7 @@ class CrashLog(symbolication.Symbolicator):
                                                       image_match.group(3).strip(), 
                                                       image_match.group(4).strip(), 
                                                       None,
-                                                      image_match.group(5))
+                                                      image_match.group(5).strip())
                         self.images.append (image)
                     else:
                         print "error: image regex failed for: %s" % line
@@ -733,6 +783,8 @@ def CreateSymbolicateCrashLogOptions(command_name, description, add_interactive_
     option_parser.add_option('--source-context', '-C', type='int', metavar='NLINES', dest='source_context', help='show NLINES source lines of source context (default = 4)', default=4)
     option_parser.add_option('--source-frames' ,       type='int', metavar='NFRAMES', dest='source_frames', help='show source for NFRAMES (default = 4)', default=4)
     option_parser.add_option('--source-all'    ,       action='store_true', dest='source_all', help='show source for all threads, not just the crashed thread', default=False)
+    option_parser.add_option('--dsyms'         ,       dest='dsyms', help='path to the root directory where all dsyms are stored, if not specified performs systemwide mdfind for dSYM', default=None)
+    option_parser.add_option('--bundles'       ,       dest='bundles', help='path to the root directory where additional bundles are stored', default=None)
     if add_interactive_options:
         option_parser.add_option('-i', '--interactive', action='store_true', help='parse all crash logs and enter interactive mode', default=False)
     return option_parser
@@ -751,6 +803,29 @@ be disassembled and lookups can be performed using the addresses found in the cr
         (options, args) = option_parser.parse_args(command_args)
     except:
         return
+
+    global DSYMS
+    if options.dsyms:
+        if not os.path.exists(options.dsyms):
+            "error: invalid dsyms path"
+        elif not os.path.isdir(options.dsyms):
+            "error: dsyms does not point to the directory"
+        else:
+            DSYMS.extend(commands.getoutput("mdfind -onlyin '{0}' \"kMDItemFSName == '*.dSYM'\"".format(os.path.abspath(options.dsyms))).splitlines())
+    if not len(DSYMS):
+        print "--dsyms is not set, perform system-wide search"
+        DSYMS.extend(commands.getoutput("mdfind \"kMDItemFSName == '*.dSYM'\"").splitlines())
+
+    global BUNDLES
+    if options.bundles:
+        if not os.path.exists(options.dsyms):
+            "error: invalid bundles path"
+        elif not os.path.isdir(options.dsyms):
+            "error: bundles does not point to the directory"
+        else:
+            BUNDLES.extend(commands.getoutput("mdfind -onlyin '{0}' \"kMDItemFSName == '*.framework' || \
+                kMDItemFSName == '*.app' || \
+                kMDItemFSName == '*.bundle'\"".format(os.path.abspath(options.bundles))).splitlines())
         
     if options.debug:
         print 'command_args = %s' % command_args
